@@ -34,6 +34,84 @@ def pct(value: float) -> str:
     return f"{value:.2%}"
 
 
+def write_swing_report_html(
+    out_path: Path,
+    *,
+    ticker: str,
+    summary_rows: list[list[object]],
+    trades: pd.DataFrame,
+) -> None:
+    """Render a standalone dark-themed HTML report for a swing DCA run.
+
+    No external dependencies — builds the markup by hand so the report opens
+    in any browser without quantstats.
+    """
+    summary_html = "\n".join(
+        "<tr><th>{label}</th><td>{value}</td></tr>".format(
+            label=escape(str(label)), value=escape(str(value))
+        )
+        for label, value in summary_rows
+    )
+
+    trade_display = trades.copy()
+    trade_display["date"] = pd.to_datetime(trade_display["date"]).dt.date
+    header_cols = ["매수일", "매수가", "수량", "매수금", "수수료", "총 비용"]
+    head_html = "".join(f"<th>{escape(col)}</th>" for col in header_cols)
+
+    body_rows: list[str] = []
+    for _, row in trade_display.iterrows():
+        cells = [
+            escape(str(row["date"])),
+            f"${float(row['buy_price']):,.2f}",
+            f"{float(row['units']):,.4f}",
+            f"${float(row['gross_cost']):,.2f}",
+            f"${float(row['fee']):,.2f}",
+            f"${float(row['total_cost']):,.2f}",
+        ]
+        body_rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    trades_html = "\n".join(body_rows)
+
+    generated_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    html = f"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(ticker)} 스윙 DCA 리포트</title>
+<style>
+  body {{ background:#101418; color:#d7dee8; font-family:-apple-system,'Segoe UI',sans-serif;
+         margin:0; padding:32px; }}
+  h1 {{ color:#eef3f8; font-size:1.6rem; margin:0 0 4px; }}
+  .meta {{ color:#91a1b3; font-size:0.85rem; margin-bottom:28px; }}
+  h2 {{ color:#eef3f8; font-size:1.1rem; margin:28px 0 12px; }}
+  table {{ border-collapse:collapse; width:100%; max-width:880px; font-size:0.9rem; }}
+  th, td {{ border:1px solid #2f3a45; padding:8px 12px; text-align:right; }}
+  thead th {{ background:#161d24; color:#91a1b3; }}
+  .summary th {{ background:#161d24; color:#91a1b3; text-align:left; width:180px; }}
+  .summary td {{ color:#f2f6fb; text-align:left; }}
+  tbody tr:nth-child(odd) {{ background:#13191f; }}
+</style>
+</head>
+<body>
+  <h1>{escape(ticker)} 스윙 DCA 리포트</h1>
+  <div class="meta">생성 시각: {escape(generated_at)}</div>
+
+  <h2>요약</h2>
+  <table class="summary"><tbody>
+  {summary_html}
+  </tbody></table>
+
+  <h2>매수 내역 ({len(trade_display)}건)</h2>
+  <table><thead><tr>{head_html}</tr></thead>
+  <tbody>
+  {trades_html}
+  </tbody></table>
+</body>
+</html>
+"""
+    out_path.write_text(html, encoding="utf-8")
+
+
 def records_for_vega(df: pd.DataFrame) -> list[dict[str, object]]:
     out = df.copy()
     if "date" in out.columns:
@@ -384,7 +462,7 @@ with right:
 
 out_dir = Path("outputs")
 out_dir.mkdir(exist_ok=True)
-    safe_name = f"{ticker}_{summary.buy_start.date()}_{summary.buy_end.date()}_{summary.sell_date.date()}"
+safe_name = f"{ticker}_{summary.buy_start.date()}_{summary.buy_end.date()}_{summary.sell_date.date()}"
 trades_path = out_dir / f"{safe_name}_swing_trades.csv"
 summary_path = out_dir / f"{safe_name}_swing_summary.csv"
 trades.to_csv(trades_path, index=False, encoding="utf-8-sig")
