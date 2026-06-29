@@ -248,7 +248,7 @@ def make_chart(
     if not ma_data.empty:
         layers.append(
             {
-                "data": {"values": ma_data.to_dict("records")},
+                "data": {"values": records_for_vega(ma_data)},
                 "mark": {"type": "line", "strokeWidth": 1.6},
                 "encoding": {
                     "x": {"field": "date", "type": "temporal"},
