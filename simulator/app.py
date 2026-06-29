@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from simulator.data import load_ohlc
-from simulator.swing import add_moving_averages, calculate_swing_dca
+from simulator.swing import add_moving_averages, calculate_swing_dca_multi
 
 
 BUY_MODE_LABELS = {
@@ -20,6 +20,13 @@ PRICE_BASIS_LABELS = {
     "open": "시가",
     "close": "종가",
 }
+
+# Candlestick / accent palette (Korean convention: 상승=빨강, 하락=파랑).
+UP_COLOR = "#e15241"
+DOWN_COLOR = "#2f80ed"
+BUY_BAND_COLOR = "#f2c94c"
+SELL_COLORS = ["#6fcf97", "#56ccf2", "#bb6bd9"]
+MA_COLORS = ["#f2c94c", "#56ccf2", "#bb6bd9", "#6fcf97", "#eb5757", "#9b9bff", "#f2994a"]
 
 
 def money(value: float) -> str:
@@ -119,163 +126,211 @@ def records_for_vega(df: pd.DataFrame) -> list[dict[str, object]]:
     return out.to_dict("records")
 
 
-def write_swing_report_html(
-    path: Path,
-    ticker: str,
-    summary_rows: list[list[str]],
-    trades: pd.DataFrame,
-) -> None:
-    trade_rows = []
-    for _, row in trades.iterrows():
-        trade_rows.append(
-            "<tr>"
-            f"<td>{escape(str(pd.to_datetime(row['date']).date()))}</td>"
-            f"<td>{float(row['buy_price']):,.2f}</td>"
-            f"<td>{float(row['units']):,.4f}</td>"
-            f"<td>{float(row['gross_cost']):,.2f}</td>"
-            f"<td>{float(row['fee']):,.2f}</td>"
-            f"<td>{float(row['total_cost']):,.2f}</td>"
-            "</tr>"
-        )
+def coerce_date(value: object) -> pd.Timestamp | None:
+    """Turn a Vega selection value into a Timestamp.
 
-    summary_html = "\n".join(
-        f"<tr><th>{escape(label)}</th><td>{escape(value)}</td></tr>"
-        for label, value in summary_rows
-    )
-    trades_html = "\n".join(trade_rows)
-
-    html = f"""<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <title>{escape(ticker)} DCA 스윙 리포트</title>
-  <style>
-    body {{ margin: 32px; background: #101418; color: #d7dee8; font-family: Arial, sans-serif; }}
-    h1, h2 {{ color: #eef3f8; }}
-    table {{ border-collapse: collapse; width: 100%; margin: 16px 0 28px; }}
-    th, td {{ border: 1px solid #2f3a45; padding: 8px 10px; text-align: right; }}
-    th {{ background: #18212a; color: #91a1b3; text-align: left; }}
-    td {{ background: #151b22; }}
-  </style>
-</head>
-<body>
-  <h1>{escape(ticker)} DCA 스윙 리포트</h1>
-  <h2>요약</h2>
-  <table>{summary_html}</table>
-  <h2>매수 내역</h2>
-  <table>
-    <tr><th>매수일</th><th>매수가</th><th>수량</th><th>매수금</th><th>수수료</th><th>총 비용</th></tr>
-    {trades_html}
-  </table>
-</body>
-</html>
-"""
-    path.write_text(html, encoding="utf-8")
+    Interval brushes come back as epoch-millisecond numbers; point clicks come
+    back as the datum's "YYYY-MM-DD" string. Handle both shapes.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return pd.to_datetime(value, unit="ms")
+    try:
+        return pd.to_datetime(value)
+    except (ValueError, TypeError):
+        return None
 
 
 def make_chart(
     prices: pd.DataFrame,
     ma_periods: list[int],
     trades: pd.DataFrame | None,
-    buy_start: pd.Timestamp,
-    buy_end: pd.Timestamp,
-    sell_date: pd.Timestamp,
+    buy_window: tuple[object, object] | None,
+    sell_dates: list[object],
+    interactive: bool = True,
 ):
+    """Build a Vega-Lite candlestick spec with optional drag/click selections."""
     chart_prices = prices.copy()
     chart_prices["date"] = pd.to_datetime(chart_prices["date"])
-    chart_prices["direction"] = chart_prices.apply(
-        lambda row: "상승" if row["close"] >= row["open"] else "하락",
-        axis=1,
+    chart_prices["방향"] = chart_prices.apply(
+        lambda row: "상승" if row["close"] >= row["open"] else "하락", axis=1
     )
 
+    # Moving-average lines (long form for a single coloured legend).
     ma_frames = []
     for period in ma_periods:
         column = f"ma_{period}"
         if column in chart_prices.columns:
-            ma_frame = chart_prices[["date", column]].dropna().copy()
-            ma_frame["period"] = f"{period}일선"
-            ma_frame = ma_frame.rename(columns={column: "value"})
-            ma_frames.append(ma_frame)
+            frame = chart_prices[["date", column]].dropna().copy()
+            frame["이평선"] = f"{period}일"
+            frame = frame.rename(columns={column: "value"})
+            ma_frames.append(frame)
     ma_data = pd.concat(ma_frames, ignore_index=True) if ma_frames else pd.DataFrame()
+    ma_order = [f"{p}일" for p in ma_periods]
 
-    layers = [
+    color_condition = {
+        "condition": {"test": "datum.close >= datum.open", "value": UP_COLOR},
+        "value": DOWN_COLOR,
+    }
+
+    layers: list[dict] = []
+
+    # 1) Buy window band.
+    if buy_window is not None:
+        start, end = buy_window
+        layers.append(
+            {
+                "data": {
+                    "values": [
+                        {
+                            "start": pd.to_datetime(start).strftime("%Y-%m-%d"),
+                            "end": pd.to_datetime(end).strftime("%Y-%m-%d"),
+                        }
+                    ]
+                },
+                "mark": {"type": "rect", "opacity": 0.14, "color": BUY_BAND_COLOR},
+                "encoding": {
+                    "x": {"field": "start", "type": "temporal"},
+                    "x2": {"field": "end"},
+                },
+            }
+        )
+
+    # 2) Candle wicks (high-low rule).
+    layers.append(
         {
-            "data": {
-                "values": [
-                    {
-                        "start": pd.to_datetime(buy_start).strftime("%Y-%m-%d"),
-                        "end": pd.to_datetime(buy_end).strftime("%Y-%m-%d"),
-                    }
-                ]
-            },
-            "mark": {"type": "rect", "opacity": 0.12, "color": "#f2c94c"},
-            "encoding": {
-                "x": {"field": "start", "type": "temporal"},
-                "x2": {"field": "end"},
-            },
-        },
-        {
-            "mark": "rule",
+            "mark": {"type": "rule"},
             "encoding": {
                 "x": {"field": "date", "type": "temporal"},
                 "y": {"field": "low", "type": "quantitative", "scale": {"zero": False}},
                 "y2": {"field": "high"},
-                "color": {
-                    "condition": {"test": "datum.close >= datum.open", "value": "#e15241"},
-                    "value": "#2f80ed",
-                },
+                "color": color_condition,
             },
-        },
-        {
-            "mark": {"type": "bar", "size": 4},
-            "encoding": {
-                "x": {"field": "date", "type": "temporal"},
-                "y": {"field": "open", "type": "quantitative", "scale": {"zero": False}},
-                "y2": {"field": "close"},
-                "color": {
-                    "condition": {"test": "datum.close >= datum.open", "value": "#e15241"},
-                    "value": "#2f80ed",
-                },
-            },
-        },
-        {
-            "data": {"values": [{"date": pd.to_datetime(sell_date).strftime("%Y-%m-%d")}]},
-            "mark": {"type": "rule", "strokeDash": [6, 4], "color": "#27ae60", "size": 2},
-            "encoding": {"x": {"field": "date", "type": "temporal"}},
-        },
-    ]
+        }
+    )
 
+    # 3) Candle bodies (open-close bar). The selection params live here so they
+    #    bind to a single unit spec (Vega-Lite forbids params on layered specs).
+    body_layer: dict = {
+        "mark": {"type": "bar", "size": 5},
+        "encoding": {
+            "x": {"field": "date", "type": "temporal"},
+            "y": {"field": "open", "type": "quantitative", "scale": {"zero": False}},
+            "y2": {"field": "close"},
+            "color": color_condition,
+            "tooltip": [
+                {"field": "date", "type": "temporal", "title": "날짜", "format": "%Y-%m-%d"},
+                {"field": "open", "type": "quantitative", "title": "시가", "format": ",.2f"},
+                {"field": "high", "type": "quantitative", "title": "고가", "format": ",.2f"},
+                {"field": "low", "type": "quantitative", "title": "저가", "format": ",.2f"},
+                {"field": "close", "type": "quantitative", "title": "종가", "format": ",.2f"},
+            ],
+        },
+    }
+    if interactive:
+        body_layer["params"] = [
+            {"name": "buy_window", "select": {"type": "interval", "encodings": ["x"]}},
+            {
+                "name": "sell_pts",
+                "select": {
+                    "type": "point",
+                    "encodings": ["x"],
+                    "toggle": True,
+                    "nearest": True,
+                },
+            },
+        ]
+    layers.append(body_layer)
+
+    # 4) Moving averages.
     if not ma_data.empty:
         layers.append(
             {
                 "data": {"values": records_for_vega(ma_data)},
-                "mark": {"type": "line", "strokeWidth": 1.6},
+                "mark": {"type": "line", "strokeWidth": 1.6, "opacity": 0.9},
                 "encoding": {
                     "x": {"field": "date", "type": "temporal"},
                     "y": {"field": "value", "type": "quantitative", "scale": {"zero": False}},
                     "color": {
-                        "field": "period",
+                        "field": "이평선",
                         "type": "nominal",
-                        "scale": {"range": ["#f2c94c", "#56ccf2", "#bb6bd9", "#6fcf97"]},
+                        "scale": {"domain": ma_order, "range": MA_COLORS[: len(ma_order)]},
+                        "legend": {"title": "이동평균"},
                     },
                 },
             }
         )
 
+    # 5) Buy markers.
     if trades is not None and not trades.empty:
-        marker_data = trades[["date", "buy_price"]].copy()
-        marker_data["date"] = pd.to_datetime(marker_data["date"]).dt.strftime("%Y-%m-%d")
+        marker = trades[["date", "buy_price"]].copy()
+        marker["date"] = pd.to_datetime(marker["date"]).dt.strftime("%Y-%m-%d")
         layers.append(
             {
-                "data": {"values": records_for_vega(marker_data)},
-                "mark": {"type": "point", "filled": True, "size": 32, "color": "#ffffff"},
+                "data": {"values": marker.to_dict("records")},
+                "mark": {
+                    "type": "point",
+                    "shape": "triangle-up",
+                    "filled": True,
+                    "size": 36,
+                    "color": "#ffffff",
+                    "stroke": "#101418",
+                    "strokeWidth": 0.4,
+                    "opacity": 0.85,
+                },
                 "encoding": {
                     "x": {"field": "date", "type": "temporal"},
                     "y": {"field": "buy_price", "type": "quantitative"},
                     "tooltip": [
                         {"field": "date", "type": "temporal", "title": "매수일"},
-                        {"field": "buy_price", "type": "quantitative", "title": "매수가"},
+                        {"field": "buy_price", "type": "quantitative", "title": "매수가", "format": ",.2f"},
                     ],
+                },
+            }
+        )
+
+    # 6) Sell lines (one dashed vertical rule + label per leg).
+    clean_sells = []
+    for index, raw in enumerate(sell_dates):
+        when = pd.to_datetime(raw)
+        clean_sells.append(
+            {
+                "date": when.strftime("%Y-%m-%d"),
+                "label": f"매도{index + 1}",
+                "color": SELL_COLORS[index % len(SELL_COLORS)],
+            }
+        )
+    if clean_sells:
+        layers.append(
+            {
+                "data": {"values": clean_sells},
+                "mark": {"type": "rule", "strokeDash": [6, 4], "size": 1.6},
+                "encoding": {
+                    "x": {"field": "date", "type": "temporal"},
+                    "color": {"field": "color", "type": "nominal", "scale": None, "legend": None},
+                },
+            }
+        )
+        layers.append(
+            {
+                "data": {"values": clean_sells},
+                "mark": {
+                    "type": "text",
+                    "align": "left",
+                    "dx": 4,
+                    "dy": -6,
+                    "baseline": "top",
+                    "fontSize": 11,
+                    "fontWeight": "bold",
+                },
+                "encoding": {
+                    "x": {"field": "date", "type": "temporal"},
+                    "y": {"value": 6},
+                    "text": {"field": "label"},
+                    "color": {"field": "color", "type": "nominal", "scale": None, "legend": None},
                 },
             }
         )
@@ -283,37 +338,98 @@ def make_chart(
     return {
         "data": {"values": records_for_vega(chart_prices)},
         "layer": layers,
-        "height": 520,
-        "resolve": {"scale": {"y": "shared"}},
+        "height": 560,
+        "autosize": {"type": "fit", "contains": "padding"},
+        "resolve": {"scale": {"y": "shared", "color": "independent"}},
+        "encoding": {
+            "x": {"axis": {"format": "%Y-%m", "labelAngle": 0, "title": None, "tickCount": 8}},
+            "y": {"axis": {"format": "$,.0f", "title": "가격"}},
+        },
         "config": {
-            "background": "#101418",
-            "view": {"stroke": "#2b3642"},
-            "axis": {"gridColor": "#25303a", "domainColor": "#3a4652"},
-            "legend": {"labelColor": "#d7dee8", "titleColor": "#d7dee8"},
+            "background": "#0f1419",
+            "font": "-apple-system, 'Segoe UI', sans-serif",
+            "view": {"stroke": "transparent"},
+            "axis": {
+                "gridColor": "#1d2530",
+                "domainColor": "#33404d",
+                "tickColor": "#33404d",
+                "labelColor": "#8a99ab",
+                "titleColor": "#aab6c4",
+                "labelFontSize": 11,
+                "titleFontSize": 12,
+            },
+            "legend": {
+                "labelColor": "#d7dee8",
+                "titleColor": "#aab6c4",
+                "orient": "top-left",
+                "fillColor": "#141b22",
+                "padding": 8,
+                "cornerRadius": 4,
+            },
         },
     }
+
+
+def read_chart_selection(prices: pd.DataFrame) -> None:
+    """Sync the latest chart drag/click into the date inputs (once per change).
+
+    Reads the selection stored under the chart's widget key, and only writes
+    back to session state when the selection actually changed, so it never
+    clobbers a manual edit the user just made in the date boxes.
+    """
+    event = st.session_state.get("swing_chart")
+    selection = getattr(event, "selection", None)
+    if not selection:
+        return
+
+    signature = repr(selection)
+    if st.session_state.get("_last_selection") == signature:
+        return
+    st.session_state["_last_selection"] = signature
+
+    # Drag → buy window.
+    window = selection.get("buy_window") or {}
+    bounds = window.get("date")
+    if bounds and len(bounds) == 2:
+        lo, hi = sorted(d for d in (coerce_date(b) for b in bounds) if d is not None)
+        in_range = prices[(prices["date"] >= lo) & (prices["date"] <= hi)]
+        if not in_range.empty:
+            st.session_state["sel_buy_start"] = in_range["date"].min().date()
+            st.session_state["sel_buy_end"] = in_range["date"].max().date()
+
+    # Clicks → up to 3 sell points.
+    points = selection.get("sell_pts") or []
+    picked: list = []
+    for point in points:
+        value = point.get("date") if isinstance(point, dict) else point
+        parsed = coerce_date(value)
+        if parsed is not None:
+            picked.append(parsed.date())
+    picked = sorted(dict.fromkeys(picked))[:3]
+    if picked:
+        st.session_state["sel_sells"] = picked
 
 
 st.set_page_config(page_title="DCA 스윙 백테스터", layout="wide")
 st.markdown(
     """
     <style>
-    .stApp { background: #101418; color: #d7dee8; }
+    .stApp { background: #0f1419; color: #d7dee8; }
     [data-testid="stSidebar"] {
-        background: #151b22;
-        border-right: 1px solid #2b3642;
+        background: #141b22;
+        border-right: 1px solid #232f3b;
     }
     .block-container { padding-top: 1.1rem; padding-bottom: 2rem; }
     h1, h2, h3 { color: #eef3f8; letter-spacing: 0; }
     [data-testid="stMetric"] {
         background: #161d24;
-        border: 1px solid #2f3a45;
-        border-radius: 4px;
+        border: 1px solid #28333e;
+        border-radius: 6px;
         padding: 12px 14px;
     }
-    [data-testid="stMetricLabel"] { color: #91a1b3; }
-    [data-testid="stMetricValue"] { color: #f2f6fb; font-size: 1.35rem; }
-    div[data-testid="stDataFrame"] { border: 1px solid #2f3a45; }
+    [data-testid="stMetricLabel"] { color: #8a99ab; }
+    [data-testid="stMetricValue"] { color: #f2f6fb; font-size: 1.3rem; }
+    div[data-testid="stDataFrame"] { border: 1px solid #28333e; border-radius: 6px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -354,15 +470,17 @@ with st.sidebar:
 
     load = st.button("차트 조회", type="primary", use_container_width=True)
 
-if not ticker:
-    st.info("좌측에서 종목을 입력하세요.")
-    st.stop()
 
 if not load and "ohlc" not in st.session_state:
     st.info("좌측 조건을 확인한 뒤 차트 조회를 누르세요.")
     st.stop()
 
-if load or "ohlc" not in st.session_state or st.session_state.get("ticker") != ticker or st.session_state.get("years") != years:
+if (
+    load
+    or "ohlc" not in st.session_state
+    or st.session_state.get("ticker") != ticker
+    or st.session_state.get("years") != years
+):
     with st.spinner("일봉 데이터를 조회하는 중"):
         st.session_state["ohlc"] = load_ohlc(ticker, years=years)
         st.session_state["ticker"] = ticker
@@ -375,21 +493,76 @@ prices = add_moving_averages(ohlc, ma_periods)
 
 min_date = prices["date"].min().date()
 max_date = prices["date"].max().date()
-default_buy_start = max(min_date, pd.Timestamp("2022-04-05").date())
-default_buy_end = min(max_date, pd.Timestamp("2023-05-05").date())
+
+# Empty by default (요구사항 1). Chart drag/click fills these via read_chart_selection.
+st.session_state.setdefault("sel_buy_start", None)
+st.session_state.setdefault("sel_buy_end", None)
+st.session_state.setdefault("sel_sells", [])
+
+read_chart_selection(prices)
 
 st.subheader("구간 선택")
-range_cols = st.columns(3)
-buy_start_input = range_cols[0].date_input("매수 시작일", value=default_buy_start, min_value=min_date, max_value=max_date)
-buy_end_input = range_cols[1].date_input("매수 종료일", value=default_buy_end, min_value=min_date, max_value=max_date)
-sell_date_input = range_cols[2].date_input("매도일", value=max(default_buy_end, max_date), min_value=min_date, max_value=max_date)
+st.caption(
+    "차트에서 **매수 구간을 드래그**하고 **매도 시점을 클릭**(최대 3개)하세요. "
+    "아래 날짜를 직접 입력해도 됩니다. 매도는 지정한 지점마다 보유량을 균등 분할해 매도합니다."
+)
+
+cols = st.columns(5)
+buy_start_input = cols[0].date_input(
+    "매수 시작", value=st.session_state["sel_buy_start"], min_value=min_date, max_value=max_date
+)
+buy_end_input = cols[1].date_input(
+    "매수 종료", value=st.session_state["sel_buy_end"], min_value=min_date, max_value=max_date
+)
+st.session_state["sel_buy_start"] = buy_start_input
+st.session_state["sel_buy_end"] = buy_end_input
+
+current_sells = st.session_state["sel_sells"]
+sell_inputs: list = []
+for i in range(3):
+    default_value = current_sells[i] if i < len(current_sells) else None
+    sell_inputs.append(
+        cols[2 + i].date_input(
+            f"매도 {i + 1}", value=default_value, min_value=min_date, max_value=max_date
+        )
+    )
+sell_dates = sorted(dict.fromkeys(s for s in sell_inputs if s is not None))
+st.session_state["sel_sells"] = sell_dates
+
+reset = st.button("선택 초기화")
+if reset:
+    st.session_state["sel_buy_start"] = None
+    st.session_state["sel_buy_end"] = None
+    st.session_state["sel_sells"] = []
+    st.session_state.pop("_last_selection", None)
+    st.rerun()
+
+inputs_ready = (
+    buy_start_input is not None and buy_end_input is not None and len(sell_dates) >= 1
+)
+
+buy_window = (
+    (buy_start_input, buy_end_input)
+    if buy_start_input is not None and buy_end_input is not None
+    else None
+)
+
+if not inputs_ready:
+    st.info("매수 시작·종료일과 매도일(최소 1개)을 지정하면 결과가 계산됩니다.")
+    st.vega_lite_chart(
+        make_chart(prices, ma_periods, None, buy_window, sell_dates, interactive=True),
+        use_container_width=True,
+        on_select="rerun",
+        key="swing_chart",
+    )
+    st.stop()
 
 try:
-    trades, summary = calculate_swing_dca(
+    trades, sells_df, summary = calculate_swing_dca_multi(
         prices,
         buy_start=pd.Timestamp(buy_start_input),
         buy_end=pd.Timestamp(buy_end_input),
-        sell_date=pd.Timestamp(sell_date_input),
+        sell_dates=[pd.Timestamp(d) for d in sell_dates],
         buy_mode=buy_mode,
         buy_amount=buy_amount,
         price_basis=price_basis,
@@ -398,6 +571,12 @@ try:
     )
 except Exception as exc:
     st.error(f"계산할 수 없습니다: {exc}")
+    st.vega_lite_chart(
+        make_chart(prices, ma_periods, None, buy_window, sell_dates, interactive=True),
+        use_container_width=True,
+        on_select="rerun",
+        key="swing_chart",
+    )
     st.stop()
 
 metric_cols = st.columns(7)
@@ -405,25 +584,25 @@ metric_cols[0].metric("총 수익률", pct(summary.return_pct))
 metric_cols[1].metric("연환산 수익률", pct(summary.annualized_return))
 metric_cols[2].metric("순손익", money(summary.net_profit))
 metric_cols[3].metric("총 투입금", money(summary.total_cost))
-metric_cols[4].metric("매도금액", money(summary.sell_value))
+metric_cols[4].metric("총 매도금액", money(summary.sell_value))
 metric_cols[5].metric("평균단가", f"${summary.average_cost:,.2f}")
 metric_cols[6].metric("보유수량", qty(summary.total_units))
 
+sell_caption = " · ".join(
+    f"매도{i + 1} {leg.date.date()} {leg.units:,.4f}주 @ ${leg.price:,.2f}"
+    for i, leg in enumerate(summary.sells)
+)
 st.caption(
     f"실제 적용 구간: 매수 {summary.buy_start.date()} ~ {summary.buy_end.date()} "
-    f"({summary.buy_days}거래일), 매도 {summary.sell_date.date()} 종가 ${summary.sell_price:,.2f}"
+    f"({summary.buy_days}거래일) · {sell_caption}"
 )
 
+actual_sell_dates = [leg.date for leg in summary.sells]
 st.vega_lite_chart(
-    make_chart(
-        prices=prices,
-        ma_periods=ma_periods,
-        trades=trades,
-        buy_start=summary.buy_start,
-        buy_end=summary.buy_end,
-        sell_date=summary.sell_date,
-    ),
+    make_chart(prices, ma_periods, trades, buy_window, actual_sell_dates, interactive=True),
     use_container_width=True,
+    on_select="rerun",
+    key="swing_chart",
 )
 
 left, right = st.columns([2, 1])
@@ -443,6 +622,23 @@ with left:
     )
     st.dataframe(trade_display, use_container_width=True, hide_index=True)
 
+    st.subheader("매도 내역")
+    sell_display = sells_df.copy()
+    sell_display["date"] = pd.to_datetime(sell_display["date"]).dt.date
+    sell_display["weight"] = (sell_display["weight"] * 100).round(1)
+    sell_display = sell_display.rename(
+        columns={
+            "date": "매도일",
+            "weight": "비중(%)",
+            "units": "수량",
+            "sell_price": "매도가",
+            "gross": "매도금",
+            "fee": "수수료",
+            "value": "실수령액",
+        }
+    )
+    st.dataframe(sell_display, use_container_width=True, hide_index=True)
+
 with right:
     st.subheader("요약")
     summary_df = pd.DataFrame(
@@ -451,8 +647,9 @@ with right:
             ["매수가 기준", PRICE_BASIS_LABELS[price_basis]],
             ["매수 거래일", f"{summary.buy_days}일"],
             ["보유 기간", f"{summary.holding_days}일"],
+            ["분할 매도 횟수", f"{len(summary.sells)}회"],
             ["평균단가", f"${summary.average_cost:,.2f}"],
-            ["매도가", f"${summary.sell_price:,.2f}"],
+            ["평균 매도가", f"${summary.avg_sell_price:,.2f}"],
             ["총 수익률", pct(summary.return_pct)],
             ["연환산 수익률", pct(summary.annualized_return)],
         ],
@@ -462,11 +659,16 @@ with right:
 
 out_dir = Path("outputs")
 out_dir.mkdir(exist_ok=True)
-safe_name = f"{ticker}_{summary.buy_start.date()}_{summary.buy_end.date()}_{summary.sell_date.date()}"
+sell_tag = "-".join(str(leg.date.date()) for leg in summary.sells)
+safe_name = f"{ticker}_{summary.buy_start.date()}_{summary.buy_end.date()}_{sell_tag}"
 trades_path = out_dir / f"{safe_name}_swing_trades.csv"
+sells_path = out_dir / f"{safe_name}_swing_sells.csv"
 summary_path = out_dir / f"{safe_name}_swing_summary.csv"
 trades.to_csv(trades_path, index=False, encoding="utf-8-sig")
-pd.DataFrame([summary.__dict__]).to_csv(summary_path, index=False, encoding="utf-8-sig")
+sells_df.to_csv(sells_path, index=False, encoding="utf-8-sig")
+pd.DataFrame([{k: v for k, v in summary.__dict__.items() if k != "sells"}]).to_csv(
+    summary_path, index=False, encoding="utf-8-sig"
+)
 
 if publish_report:
     html_path = out_dir / f"{safe_name}_swing_report.html"
@@ -481,4 +683,6 @@ if publish_report:
     except Exception as exc:
         st.warning(f"리포트 발행 실패: {exc}")
 
-st.caption(f"거래내역 저장: {trades_path.resolve()} / 요약 저장: {summary_path.resolve()}")
+st.caption(
+    f"저장: {trades_path.name} · {sells_path.name} · {summary_path.name} (outputs/)"
+)
