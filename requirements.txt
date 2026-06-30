@@ -3,4 +3,6 @@ numpy
 yfinance
 quantstats
 streamlit
+fastapi
+uvicorn
 
