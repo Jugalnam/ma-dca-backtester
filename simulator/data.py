@@ -34,18 +34,31 @@ def load_prices(ticker: str, years: int = 10) -> pd.DataFrame:
     return df[["date", "close"]].sort_values("date").reset_index(drop=True)
 
 
-def load_ohlc(ticker: str, years: int = 10) -> pd.DataFrame:
-    """Load adjusted daily OHLC prices from Yahoo Finance."""
+def load_ohlc(ticker: str, years: int = 10, warmup_days: int = 0) -> pd.DataFrame:
+    """Load adjusted daily OHLC prices from Yahoo Finance.
+
+    ``warmup_days`` fetches extra history before the displayed range so rolling
+    indicators can be calculated without changing shape when the visible range
+    changes.
+    """
     if yf is None:
         raise RuntimeError("yfinance is required. Install dependencies with: pip install -r requirements.txt")
 
-    df = yf.download(
-        ticker,
-        period=f"{years}y",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
+    kwargs = {
+        "tickers": ticker,
+        "interval": "1d",
+        "auto_adjust": True,
+        "progress": False,
+    }
+    if warmup_days > 0:
+        end = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+        start = end - pd.DateOffset(years=years) - pd.Timedelta(days=int(warmup_days))
+        kwargs["start"] = start.date()
+        kwargs["end"] = end.date()
+    else:
+        kwargs["period"] = f"{years}y"
+
+    df = yf.download(**kwargs)
     if df.empty:
         raise ValueError(f"No data: {ticker}")
 

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from html import escape
 
 import pandas as pd
 import streamlit as st
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from simulator.data import load_ohlc
 from simulator.swing import add_moving_averages, calculate_swing_dca_multi
@@ -27,6 +32,7 @@ DOWN_COLOR = "#2f80ed"
 BUY_BAND_COLOR = "#f2c94c"
 SELL_COLORS = ["#6fcf97", "#56ccf2", "#bb6bd9"]
 MA_COLORS = ["#f2c94c", "#56ccf2", "#bb6bd9", "#6fcf97", "#eb5757", "#9b9bff", "#f2994a"]
+TRADING_DAYS_PER_YEAR = 252
 
 
 def money(value: float) -> str:
@@ -39,6 +45,30 @@ def qty(value: float) -> str:
 
 def pct(value: float) -> str:
     return f"{value:.2%}"
+
+
+def ma_warmup_days(ma_periods: list[int]) -> int:
+    """Calendar-day buffer for stable moving averages at the chart's left edge."""
+    max_period = max(ma_periods) if ma_periods else 0
+    return int((max_period / TRADING_DAYS_PER_YEAR) * 365) + 45 if max_period else 0
+
+
+def visible_price_window(prices: pd.DataFrame, years: int) -> pd.DataFrame:
+    if prices.empty:
+        return prices.copy()
+    latest = pd.to_datetime(prices["date"]).max()
+    display_start = latest - pd.DateOffset(years=years)
+    return prices[pd.to_datetime(prices["date"]) >= display_start].reset_index(drop=True).copy()
+
+
+def load_chart_ohlc(ticker: str, years: int, warmup_days: int) -> pd.DataFrame:
+    try:
+        return load_ohlc(ticker, years=years, warmup_days=warmup_days)
+    except TypeError as exc:
+        if "warmup_days" not in str(exc):
+            raise
+        fetch_years = years + max(1, int((warmup_days + 364) / 365))
+        return load_ohlc(ticker, years=fetch_years)
 
 
 def write_swing_report_html(
@@ -155,6 +185,12 @@ def make_chart(
     """Build a Vega-Lite candlestick spec with optional drag/click selections."""
     chart_prices = prices.copy()
     chart_prices["date"] = pd.to_datetime(chart_prices["date"])
+    span_days = max(1, (chart_prices["date"].max() - chart_prices["date"].min()).days)
+    row_count = len(chart_prices)
+    candle_size = 6 if row_count <= 260 else 4 if row_count <= 760 else 2 if row_count <= 1400 else 1
+    candle_opacity = 0.9 if row_count <= 760 else 0.68
+    wick_opacity = 0.8 if row_count <= 760 else 0.48
+    x_tick_count = max(5, min(12, int(span_days / 180) + 1))
     chart_prices["방향"] = chart_prices.apply(
         lambda row: "상승" if row["close"] >= row["open"] else "하락", axis=1
     )
@@ -202,7 +238,7 @@ def make_chart(
     # 2) Candle wicks (high-low rule).
     layers.append(
         {
-            "mark": {"type": "rule"},
+            "mark": {"type": "rule", "opacity": wick_opacity},
             "encoding": {
                 "x": {"field": "date", "type": "temporal"},
                 "y": {"field": "low", "type": "quantitative", "scale": {"zero": False}},
@@ -215,7 +251,7 @@ def make_chart(
     # 3) Candle bodies (open-close bar). The selection params live here so they
     #    bind to a single unit spec (Vega-Lite forbids params on layered specs).
     body_layer: dict = {
-        "mark": {"type": "bar", "size": 5},
+        "mark": {"type": "bar", "size": candle_size, "opacity": candle_opacity},
         "encoding": {
             "x": {"field": "date", "type": "temporal"},
             "y": {"field": "open", "type": "quantitative", "scale": {"zero": False}},
@@ -250,7 +286,7 @@ def make_chart(
         layers.append(
             {
                 "data": {"values": records_for_vega(ma_data)},
-                "mark": {"type": "line", "strokeWidth": 1.6, "opacity": 0.9},
+                "mark": {"type": "line", "strokeWidth": 2.0, "opacity": 0.95},
                 "encoding": {
                     "x": {"field": "date", "type": "temporal"},
                     "y": {"field": "value", "type": "quantitative", "scale": {"zero": False}},
@@ -338,11 +374,11 @@ def make_chart(
     return {
         "data": {"values": records_for_vega(chart_prices)},
         "layer": layers,
-        "height": 560,
+        "height": 600 if span_days >= 365 * 4 else 560,
         "autosize": {"type": "fit", "contains": "padding"},
         "resolve": {"scale": {"y": "shared", "color": "independent"}},
         "encoding": {
-            "x": {"axis": {"format": "%Y-%m", "labelAngle": 0, "title": None, "tickCount": 8}},
+            "x": {"axis": {"format": "%Y-%m", "labelAngle": 0, "title": None, "tickCount": x_tick_count}},
             "y": {"axis": {"format": "$,.0f", "title": "가격"}},
         },
         "config": {
@@ -440,7 +476,7 @@ st.title("DCA 스윙 백테스터")
 with st.sidebar:
     st.subheader("종목 / 차트")
     ticker = st.text_input("종목", value="TSLA").upper().strip()
-    years = st.slider("조회 기간", min_value=1, max_value=20, value=10)
+    years = st.slider("조회 기간(연)", min_value=1, max_value=20, value=5)
     ma_periods = st.multiselect(
         "표시할 이평선",
         options=[20, 50, 100, 150, 200, 300, 400],
@@ -471,6 +507,9 @@ with st.sidebar:
     load = st.button("차트 조회", type="primary", use_container_width=True)
 
 
+ma_periods = ma_periods or [400]
+warmup_days = ma_warmup_days(ma_periods)
+
 if not load and "ohlc" not in st.session_state:
     st.info("좌측 조건을 확인한 뒤 차트 조회를 누르세요.")
     st.stop()
@@ -480,16 +519,17 @@ if (
     or "ohlc" not in st.session_state
     or st.session_state.get("ticker") != ticker
     or st.session_state.get("years") != years
+    or st.session_state.get("warmup_days") != warmup_days
 ):
     with st.spinner("일봉 데이터를 조회하는 중"):
-        st.session_state["ohlc"] = load_ohlc(ticker, years=years)
+        st.session_state["ohlc"] = load_chart_ohlc(ticker, years=years, warmup_days=warmup_days)
         st.session_state["ticker"] = ticker
         st.session_state["years"] = years
+        st.session_state["warmup_days"] = warmup_days
 
 ohlc = st.session_state["ohlc"].copy()
 ohlc["date"] = pd.to_datetime(ohlc["date"])
-ma_periods = ma_periods or [400]
-prices = add_moving_averages(ohlc, ma_periods)
+prices = visible_price_window(add_moving_averages(ohlc, ma_periods), years)
 
 min_date = prices["date"].min().date()
 max_date = prices["date"].max().date()
@@ -498,6 +538,13 @@ max_date = prices["date"].max().date()
 st.session_state.setdefault("sel_buy_start", None)
 st.session_state.setdefault("sel_buy_end", None)
 st.session_state.setdefault("sel_sells", [])
+for key in ("sel_buy_start", "sel_buy_end"):
+    selected = st.session_state.get(key)
+    if selected is not None and not (min_date <= selected <= max_date):
+        st.session_state[key] = None
+st.session_state["sel_sells"] = [
+    selected for selected in st.session_state["sel_sells"] if min_date <= selected <= max_date
+]
 
 read_chart_selection(prices)
 
