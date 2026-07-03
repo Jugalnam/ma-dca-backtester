@@ -91,6 +91,28 @@ def test_take_profit_exits_existing_position() -> None:
     assert result["units"].iloc[-1] == 0.0
 
 
+def test_trailing_stop_exits_after_peak_drawdown() -> None:
+    prices = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=7, freq="D"),
+            "close": [10.0, 10.0, 10.0, 9.0, 12.0, 11.0, 9.0],
+        }
+    )
+    strategy = DCABelowMA(
+        {
+            "ma_period": 3,
+            "entry_mode": "accumulate_below",
+            "sell_mode": "trailing_stop",
+            "daily_amount": 30.0,
+            "trailing_stop_pct": 0.2,
+        }
+    )
+    result = Engine().run(prices, strategy, ma_periods=(3,))
+
+    assert result["sold_today"].iloc[-1] > 0
+    assert result["units"].iloc[-1] == 0.0
+
+
 def test_dca_summary_and_buy_and_hold() -> None:
     prices = pd.DataFrame(
         {

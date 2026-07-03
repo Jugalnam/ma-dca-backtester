@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 
 try:
     import yfinance as yf
 except ImportError:  # pragma: no cover - exercised only before dependencies are installed
     yf = None
+
+if yf is not None:
+    try:
+        cache_dir = Path("outputs") / "yfinance_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        yf.cache.set_cache_location(str(cache_dir))
+    except Exception:
+        # Data loading still works without an explicit cache; this only avoids
+        # host-level cache permission issues in restricted environments.
+        pass
 
 
 def load_prices(ticker: str, years: int = 10) -> pd.DataFrame:

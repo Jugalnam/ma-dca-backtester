@@ -22,6 +22,7 @@ def run_sweep(
     slippage_rate: float = 0.0,
     take_profit_pct: float = 0.2,
     stop_loss_pct: float = 0.2,
+    trailing_stop_pct: float = 0.1,
     make_html: bool = True,
 ) -> pd.DataFrame:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -43,6 +44,7 @@ def run_sweep(
                         "daily_amount": daily_amount,
                         "take_profit_pct": take_profit_pct,
                         "stop_loss_pct": stop_loss_pct,
+                        "trailing_stop_pct": trailing_stop_pct,
                     }
                     strategy = DCABelowMA(cfg)
                     result = engine.run(prices, strategy, ma_periods=tuple(sorted(set(ma_periods))))
@@ -82,6 +84,7 @@ def run_sweep(
                             "slippage_rate": slippage_rate,
                             "take_profit_pct": take_profit_pct,
                             "stop_loss_pct": stop_loss_pct,
+                            "trailing_stop_pct": trailing_stop_pct,
                             "final_value": summary["final_value"],
                             "contributed": summary["contributed"],
                             "multiple": summary["multiple"],
@@ -111,7 +114,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sell-modes",
         nargs="+",
-        choices=["hold", "sell_above_ma", "take_profit", "stop_loss", "take_profit_or_stop_loss"],
+        choices=[
+            "hold",
+            "sell_above_ma",
+            "take_profit",
+            "stop_loss",
+            "take_profit_or_stop_loss",
+            "trailing_stop",
+        ],
         default=["hold"],
     )
     parser.add_argument("--out-dir", type=Path, default=Path("outputs"))
@@ -119,6 +129,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slippage-rate", type=float, default=0.0)
     parser.add_argument("--take-profit-pct", type=float, default=0.2)
     parser.add_argument("--stop-loss-pct", type=float, default=0.2)
+    parser.add_argument("--trailing-stop-pct", type=float, default=0.1)
     parser.add_argument("--html", action="store_true", help="Generate quantstats HTML reports")
     return parser.parse_args()
 
@@ -137,6 +148,7 @@ def main() -> None:
         slippage_rate=args.slippage_rate,
         take_profit_pct=args.take_profit_pct,
         stop_loss_pct=args.stop_loss_pct,
+        trailing_stop_pct=args.trailing_stop_pct,
         make_html=args.html,
     )
     print(comparison.to_string(index=False))

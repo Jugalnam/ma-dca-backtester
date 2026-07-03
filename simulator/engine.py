@@ -48,6 +48,7 @@ class DCABelowMA(Strategy):
         actions: list[dict[str, Any]] = []
 
         if self._should_sell(ctx, ma, sell_mode):
+            self.state.pop("peak_price", None)
             return [{"type": "sell_all"}]
 
         if mode == "accumulate_below":
@@ -72,6 +73,7 @@ class DCABelowMA(Strategy):
         avg_cost = ctx.portfolio.invested / ctx.portfolio.units if ctx.portfolio.units else 0.0
         take_profit_pct = float(self.cfg.get("take_profit_pct", 0.2))
         stop_loss_pct = float(self.cfg.get("stop_loss_pct", 0.2))
+        trailing_stop_pct = float(self.cfg.get("trailing_stop_pct", 0.1))
 
         if sell_mode == "sell_above_ma":
             return ctx.price >= ma
@@ -84,6 +86,10 @@ class DCABelowMA(Strategy):
                 ctx.price >= avg_cost * (1.0 + take_profit_pct)
                 or ctx.price <= avg_cost * (1.0 - stop_loss_pct)
             )
+        if sell_mode == "trailing_stop":
+            peak_price = max(float(self.state.get("peak_price", ctx.price)), ctx.price)
+            self.state["peak_price"] = peak_price
+            return ctx.price <= peak_price * (1.0 - trailing_stop_pct)
 
         raise ValueError(f"Unknown sell_mode: {sell_mode}")
 
