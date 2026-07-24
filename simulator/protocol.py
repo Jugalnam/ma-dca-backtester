@@ -33,6 +33,22 @@ import pandas as pd
 class ProtocolParams:
     ma_period: int = 400
     daily_amount: float = 10.0
+    # Optional tiered accumulation: ((dev_floor, amount), ...) sorted shallow
+    # to deep. The amount of the deepest zone whose floor is above `dev` wins,
+    # e.g. ((-0.10, 10), (-0.20, 20), (-1.0, 30)) buys 10 while the deviation
+    # is above -10%, 20 down to -20%, then 30. None = flat daily_amount.
+    amount_ladder: tuple[tuple[float, float], ...] | None = None
+    # True: the zone is judged on the last WEEKLY close and holds for the next
+    # week (matches real ops where the app's daily amount is set weekly).
+    ladder_weekly: bool = False
+
+    def amount_for(self, dev: float) -> float:
+        if self.amount_ladder is None:
+            return self.daily_amount
+        for floor, amount in self.amount_ladder:
+            if dev > floor:
+                return amount
+        return self.amount_ladder[-1][1]
     x1: float = 0.10          # tranche-1 deviation above MA
     x2: float = 0.20          # tranche-2 deviation above MA
     giveback: float = 0.5     # trailing: fraction of peak deviation given back
@@ -88,6 +104,7 @@ def run_protocol(
     armed = True                       # disarmed after a circuit until re-arm
     pending: dict[str, Any] | None = None  # executes at today's close
     time_limit = pd.Timedelta(days=params.time_months * 30.4375)
+    weekly_dev: float | None = None    # last weekly-close deviation (ladder)
 
     records: list[dict[str, Any]] = []
 
@@ -131,12 +148,14 @@ def run_protocol(
         if not armed and weekly and price >= ma:
             armed = True
 
-        # 3) Layer A — daily accumulation below the MA.
+        # 3) Layer A — daily accumulation below the MA (optionally tiered).
         if armed and price < ma:
             if cur is None:
                 cur = Cycle(cycle_id=len(cycles) + 1, start=date,
                             below_streak_start=date)
-            amount = params.daily_amount
+            ladder_dev = (weekly_dev if params.ladder_weekly
+                          and weekly_dev is not None else dev)
+            amount = params.amount_for(ladder_dev)
             exec_price = price * (1.0 + params.slippage_rate)
             cur.contributed += amount
             cur.units += (amount * (1.0 - params.fee_rate)) / exec_price
@@ -171,6 +190,9 @@ def run_protocol(
                 elif (cur.tranches_sold >= 1 and cur.max_dev > 0
                         and dev <= cur.max_dev * (1.0 - params.giveback)):
                     pending = {"kind": "liquidate", "exit_type": "trailing"}
+
+        if weekly:
+            weekly_dev = dev
 
         records.append({"date": date, "price": price, "ma": ma,
                         "bought": bought_today, "sold": sold_today})
